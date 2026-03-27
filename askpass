@@ -56,6 +56,10 @@ SSH_KEY_TYPES = [
     ("~/.ssh/id_dsa", "DSA")
 ]
 
+def has_display():
+    """Check if a display server is available (X11 or Wayland)"""
+    return 'DISPLAY' in os.environ or 'WAYLAND_DISPLAY' in os.environ
+
 def check_age_available():
     """Check if age encryption tool is available"""
     try:
@@ -301,19 +305,19 @@ def show_confirmation_dialog():
     user = os.environ.get('USER', 'unknown')
     
     # Try Tkinter first
-    if HAS_GUI and 'DISPLAY' in os.environ:
+    if HAS_GUI and has_display():
         try:
             root = tk.Tk()
             root.withdraw()  # Hide the main window
             root.attributes('-topmost', True)  # Bring to front
-            
+
             # Create dialog message
             message = f"Administrator privileges requested\n\n"
             message += f"User: {user}\n"
             message += f"Host: {hostname}\n"
             message += f"Command: {command}\n\n"
             message += "Do you want to allow this?"
-            
+
             result = messagebox.askyesno(
                 "Sudo Authentication Required",
                 message,
@@ -323,9 +327,9 @@ def show_confirmation_dialog():
             return result
         except Exception as e:
             syslog.syslog(syslog.LOG_WARNING, f"Tkinter dialog failed: {e}")
-    
+
     # Try GTK as fallback
-    if HAS_GTK and 'DISPLAY' in os.environ:
+    if HAS_GTK and has_display():
         try:
             dialog = Gtk.MessageDialog(
                 parent=None,
@@ -342,84 +346,112 @@ def show_confirmation_dialog():
             )
             dialog.set_keep_above(True)
             dialog.set_urgency_hint(True)
-            
+
             response = dialog.run()
             dialog.destroy()
             return response == Gtk.ResponseType.YES
         except Exception as e:
             syslog.syslog(syslog.LOG_WARNING, f"GTK dialog failed: {e}")
-    
+
     # Fallback to zenity if available
-    if 'DISPLAY' in os.environ:
+    if has_display():
         try:
             message = f"Administrator privileges requested\\n\\n"
             message += f"User: {user}\\n"
             message += f"Host: {hostname}\\n"
             message += f"Command: {command}\\n\\n"
             message += "Do you want to allow this?"
-            
+
             result = subprocess.run(
                 ['zenity', '--question', '--title=Sudo Authentication Required',
                  f'--text={message}', '--width=400'],
                 capture_output=True
             )
             return result.returncode == 0
-        except:
+        except FileNotFoundError:
             pass
-    
-    # If GUI is not available, try TOTP confirmation
-    if 'DISPLAY' not in os.environ:
+
+    # Try notify-send as a visual alert even if no interactive dialog is available
+    try:
+        subprocess.run(
+            ['notify-send', '-u', 'critical', '-t', '0',
+             'Sudo Authentication Required',
+             f'User: {user}\nHost: {hostname}\nCommand: {command}'],
+            capture_output=True
+        )
+    except FileNotFoundError:
+        pass
+
+    # If no display available, try TOTP confirmation
+    if not has_display():
         syslog.syslog(syslog.LOG_INFO, "No display available, trying TOTP confirmation")
         return prompt_totp_confirmation()
 
+    sys.stderr.write(
+        f"Error: Could not show confirmation dialog (no working GUI toolkit found).\n"
+        f"Install zenity (sudo apt install zenity) or python3-tk for GUI confirmation.\n"
+    )
     return False
 
 def check_security():
     """Perform security checks before retrieving password"""
     # 0. Rate limit check
     if not check_rate_limit():
+        sys.stderr.write("Error: Rate limit exceeded. Too many sudo attempts.\n")
         return False
-    
+
     # 1. Path-based restriction
     cwd = os.getcwd()
     if not any(cwd.startswith(path) for path in ALLOWED_PATHS):
-        syslog.syslog(syslog.LOG_WARNING, f"Askpass called from unauthorized path: {cwd}")
+        msg = f"Askpass called from unauthorized path: {cwd}"
+        syslog.syslog(syslog.LOG_WARNING, msg)
+        sys.stderr.write(f"Error: {msg}\n")
         return False
-    
+
     # 2. Process validation
     try:
         ppid = os.getppid()
         proc_name = open(f'/proc/{ppid}/comm').read().strip()
         if proc_name not in ALLOWED_PARENT_PROCESSES:
-            syslog.syslog(syslog.LOG_WARNING, f"Askpass called by unauthorized process: {proc_name}")
+            msg = f"Askpass called by unauthorized process: {proc_name}"
+            syslog.syslog(syslog.LOG_WARNING, msg)
+            sys.stderr.write(f"Error: {msg}\n")
+            sys.stderr.write(f"Add '{proc_name}' to allowed_processes in askpass-config.json to permit it.\n")
             return False
     except Exception:
         syslog.syslog(syslog.LOG_WARNING, "Could not determine parent process")
+        sys.stderr.write("Error: Could not determine parent process.\n")
         return False
-    
+
     # 3. Environment verification
-    if not (os.getenv('SSH_AUTH_SOCK') or os.getenv('SSH_TTY') or os.getenv('TERM')):
-        syslog.syslog(syslog.LOG_WARNING, "Askpass called without proper environment")
+    if not (os.getenv('SSH_AUTH_SOCK') or os.getenv('SSH_TTY') or os.getenv('TERM')
+            or has_display()):
+        msg = "Askpass called without SSH_AUTH_SOCK, SSH_TTY, TERM, or display"
+        syslog.syslog(syslog.LOG_WARNING, msg)
+        sys.stderr.write(f"Error: {msg}\n")
         return False
-    
+
     # 4. Time-based expiration check
-    if os.path.exists(SSH_ENCRYPTED_FILE):
-        age = time.time() - os.path.getmtime(SSH_ENCRYPTED_FILE)
+    encrypted_file = AGE_ENCRYPTED_FILE if os.path.exists(AGE_ENCRYPTED_FILE) else SSH_ENCRYPTED_FILE
+    if os.path.exists(encrypted_file):
+        age = time.time() - os.path.getmtime(encrypted_file)
         if age > EXPIRATION_HOURS * 3600:
             syslog.syslog(syslog.LOG_INFO, f"Password expired after {EXPIRATION_HOURS} hours")
+            sys.stderr.write(f"Error: Stored password has expired (>{EXPIRATION_HOURS}h). Run 'askpass-manager set' to refresh.\n")
             try:
-                os.remove(SSH_ENCRYPTED_FILE)
-            except:
+                os.remove(encrypted_file)
+            except Exception:
                 pass
             return False
-    
+
     # 5. User confirmation dialog (if enabled and GUI available)
     if REQUIRE_USER_CONFIRMATION:
         if not show_confirmation_dialog():
             syslog.syslog(syslog.LOG_WARNING, "User denied sudo access via dialog")
+            sys.stderr.write("Error: Sudo access denied by user confirmation.\n")
             return False
         syslog.syslog(syslog.LOG_INFO, "User approved sudo access via dialog")
-    
+
     return True
 
 def ensure_ssh_key_loaded():
@@ -477,7 +509,7 @@ def ensure_ssh_key_loaded():
 def prompt_ssh_passphrase():
     """Prompt for SSH key passphrase using GUI"""
     # Try Tkinter first
-    if HAS_GUI and 'DISPLAY' in os.environ:
+    if HAS_GUI and has_display():
         try:
             import tkinter.simpledialog as simpledialog
             root = tk.Tk()
@@ -495,7 +527,7 @@ def prompt_ssh_passphrase():
             pass
 
     # Try zenity
-    if 'DISPLAY' in os.environ:
+    if has_display():
         try:
             result = subprocess.run(
                 ['zenity', '--password', '--title=SSH Key Passphrase Required',
@@ -509,7 +541,7 @@ def prompt_ssh_passphrase():
             pass
 
     # Try kdialog
-    if 'DISPLAY' in os.environ:
+    if has_display():
         try:
             result = subprocess.run(
                 ['kdialog', '--password', f'Enter passphrase for {SSH_KEY}:'],

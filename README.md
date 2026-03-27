@@ -2,6 +2,8 @@
 
 A secure askpass implementation using SSH key encryption for non-interactive sudo operations.
 
+> **Context:** This tool was created to allow AI coding assistants (Claude Code, Cursor) to run `sudo` commands on Linux with per-command GUI confirmation. See [this guide](https://www.ricardodecal.com/guides/running-sudo-commands-in-claude-code-and-cursor/) for the full walkthrough. This is a fork of [GlassOnTin/secure-askpass](https://github.com/GlassOnTin/secure-askpass) with Wayland support, verbose error messages, and silent failure fixes.
+
 ## Installation
 
 1. Clone this repository
